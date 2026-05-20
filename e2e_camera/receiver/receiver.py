@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Cloud/monitor-side receiver for 6-camera ZMQ stream."""
-
+"""Cloud/monitor-side receiver for 6-camera ZMQ stream. (Save only latest frame)"""
 from __future__ import annotations
 
 import argparse
@@ -65,14 +64,18 @@ def annotate(img, text: str):
     cv2.putText(img, text, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
 
-def save_payload(base_dir: Path, images: List[np.ndarray], header: dict):
+def save_latest_payload(base_dir: Path, images: List[np.ndarray], header: dict):
+    """保存最新一帧数据，自动覆盖旧文件，只保留最新一份"""
     base_dir.mkdir(parents=True, exist_ok=True)
-    stamp = int(header.get("ts_unix", time.time()) * 1000)
-    frame_dir = base_dir / f"frame_{stamp}"
-    frame_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 固定文件名，每次覆盖，不创建时间戳子文件夹
     for i, img in enumerate(images):
-        cv2.imwrite(str(frame_dir / f"cam_{i}.jpg"), img)
-    (frame_dir / "header.msgpack").write_bytes(msgpack.packb(header, use_bin_type=True))
+        img_path = base_dir / f"cam_{i}_latest.jpg"
+        cv2.imwrite(str(img_path), img)
+    
+    # 保存最新的header信息
+    header_path = base_dir / "header_latest.msgpack"
+    header_path.write_bytes(msgpack.packb(header, use_bin_type=True))
 
 
 def main() -> int:
@@ -212,8 +215,9 @@ def main() -> int:
                 oneway_window = []
                 machine_diff_window = []
 
+            # 保存最新帧（覆盖模式）
             if args.save_dir:
-                save_payload(Path(args.save_dir), images, header)
+                save_latest_payload(Path(args.save_dir), images, header)
 
             if not args.headless:
                 overlay_text = (

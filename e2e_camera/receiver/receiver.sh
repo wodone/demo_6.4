@@ -6,7 +6,7 @@ PORT="3721"
 ACK_PORT="2137"
 
 # 改成 sender 那台机器的实际 IP
-TARGET_IP="100.67.69.62"
+TARGET_IP="100.64.64.122"
 
 echo "📡 正在尝试连接发送端: $TARGET_IP:$PORT ..."
 
