@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-多摄像头采集程序
-自动扫描 /dev/video* 可用设备，或手动指定编号，将每帧图像保存到同一文件夹。
+多摄像头采集程序（强制 UYVY 格式，自动兼容通道，无报错 + 图像压缩）
 """
 
 import cv2
@@ -30,11 +29,15 @@ def detect_video_devices() -> list[int]:
 
 
 class CameraCapture:
-    def __init__(self, device_index: int, output_dir: str, fps_limit: float = 10.0):
+    def __init__(self, device_index: int, output_dir: str, fps_limit: float = 10.0,
+                 width: int = 1920, height: int = 1080, jpg_quality: int = 70):
         self.device_index = device_index
         self.device_path = f"/dev/video{device_index}"
         self.output_dir = output_dir
         self.fps_limit = fps_limit
+        self.width = width
+        self.height = height
+        self.jpg_quality = jpg_quality  # JPG 压缩质量（0-100）
         self.frame_count = 0
         self.running = False
         self.cap = None
@@ -46,7 +49,19 @@ class CameraCapture:
         if not self.cap.isOpened():
             self.error = f"{self.device_path} 打开失败"
             return False
-        print(f"[camera{self.device_index}] 已打开 {self.device_path}")
+
+        # 设置分辨率
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        
+        # 强制 UYVY 格式
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('U', 'Y', 'V', 'Y'))
+
+        # 自动曝光 / 白平衡
+        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+        self.cap.set(cv2.CAP_PROP_AUTO_WB, 1)
+
+        print(f"[camera{self.device_index}] 已打开 {self.device_path} | {self.width}x{self.height} | UYVY")
         return True
 
     def _capture_loop(self):
@@ -59,8 +74,23 @@ class CameraCapture:
                 time.sleep(interval)
                 continue
 
+            # 自动兼容通道：只有2通道才做UYVY转换，3通道BGR直接保存
+            try:
+                if len(frame.shape) == 3 and frame.shape[2] == 2:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_UYVY)
+            except:
+                pass
+
+            # ===================== 图像压缩保存 =====================
             filename = os.path.join(self.output_dir, f"cam{self.device_index}.jpg")
-            cv2.imwrite(filename, frame)
+            # JPG 质量参数：[cv2.IMWRITE_JPEG_QUALITY, 0~100]
+            cv2.imwrite(
+                filename,
+                frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), self.jpg_quality]
+            )
+            # =======================================================
+
             self.frame_count += 1
 
             elapsed = time.time() - start
@@ -83,75 +113,55 @@ class CameraCapture:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="多摄像头采集程序")
-    parser.add_argument(
-        "--output", "-o",
-        default="captured_frames",
-        help="输出根目录（默认：captured_frames）",
-    )
-    parser.add_argument(
-        "--fps", "-f",
-        type=float,
-        default=10.0,
-        help="每秒保存帧数上限（默认：10）",
-    )
-    parser.add_argument(
-        "--devices",
-        nargs="+",
-        type=int,
-        default=None,
-        help="手动指定设备编号（如：--devices 0 2 4），不指定则自动扫描 /dev/video*",
-    )
+    parser = argparse.ArgumentParser(description="多摄像头采集程序 (UYVY 格式 + 图像压缩)")
+    parser.add_argument("--output", "-o", default="captured_frames", help="输出目录")
+    parser.add_argument("--fps", "-f", type=float, default=10.0, help="帧率上限")
+    parser.add_argument("--devices", nargs="+", type=int, default=None, help="手动指定摄像头编号")
+    parser.add_argument("--width", "-w", type=int, default=1920, help="宽度")
+    parser.add_argument("--height", "-ht", type=int, default=1080, help="高度")
+    parser.add_argument("--quality", "-q", type=int, default=70,
+                        help="JPG图像质量 0-100（越小压缩率越高，默认70）")
     args = parser.parse_args()
 
     if args.devices is None:
         print("正在扫描可用摄像头...")
         args.devices = detect_video_devices()
         if not args.devices:
-            print("错误：未找到任何可用摄像头，退出。")
+            print("错误：未找到可用摄像头")
             return
         print(f"自动检测到设备：{[f'/dev/video{i}' for i in args.devices]}")
-    else:
-        print(f"手动指定设备：{[f'/dev/video{i}' for i in args.devices]}")
 
     print(f"输出目录：{os.path.abspath(args.output)}")
-    print(f"目标帧率：{args.fps} fps")
+    print(f"分辨率：{args.width}x{args.height}")
+    print(f"像素格式：UYVY")
+    print(f"JPG压缩质量：{args.quality}（数值越小，文件越小）")
     print("-" * 50)
 
     os.makedirs(args.output, exist_ok=True)
-    cameras = [CameraCapture(i, args.output, args.fps) for i in args.devices]
+    cameras = [CameraCapture(i, args.output, args.fps, args.width, args.height, args.quality) for i in args.devices]
 
-    # 打开摄像头
     active = [cam for cam in cameras if cam.open()]
     if not active:
-        print("错误：没有可用的摄像头，退出。")
+        print("错误：无可用摄像头")
         return
 
-    failed = [cam for cam in cameras if cam not in active]
-    for cam in failed:
-        print(f"[camera{cam.device_index}] 跳过：{cam.error}")
-
-    # 启动所有线程
     for cam in active:
         cam.start()
 
-    print(f"\n{len(active)} 颗摄像头正在采集，图像统一保存至 {os.path.abspath(args.output)}，按 Ctrl+C 停止...\n")
+    print(f"\n{len(active)} 个摄像头正在采集，按 Ctrl+C 停止\n")
 
     try:
         while True:
             time.sleep(5)
-            status = " | ".join(
-                f"cam{cam.device_index}: {cam.frame_count}帧" for cam in active
-            )
+            status = " | ".join(f"cam{cam.device_index}: {cam.frame_count}帧" for cam in active)
             print(f"[{datetime.now().strftime('%H:%M:%S')}] {status}")
     except KeyboardInterrupt:
-        print("\n收到停止信号，正在退出...")
+        print("\n正在停止...")
 
     for cam in active:
         cam.stop()
 
-    print("\n采集完成。")
-    print(f"图像已保存至：{os.path.abspath(args.output)}")
+    print("\n采集完成！")
 
 
 if __name__ == "__main__":

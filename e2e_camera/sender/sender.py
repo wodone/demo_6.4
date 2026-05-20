@@ -108,30 +108,58 @@ def open_cameras(device_ids: Sequence[int]) -> List[CameraSource]:
 
 def encode_jpeg(frame, wh: Tuple[int, int], quality: int) -> bytes:
     w, h = wh
-    resized = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-    ok, enc = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    if not ok:
-        raise RuntimeError("cv2.imencode failed")
+    try:
+        resized = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+        ok, enc = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if ok:
+            return enc.tobytes()
+    except Exception:
+        pass
+    
+    # 编码失败返回纯黑图
+    black = np.zeros((h, w, 3), dtype=np.uint8)
+    ok, enc = cv2.imencode(".jpg", black, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return enc.tobytes()
 
 
-def get_frames_from_files(paths: Sequence[str]) -> List:
+def get_frames_from_files(paths: Sequence[str], target_size: Tuple[int, int]) -> List:
+    """读取文件失败时返回纯黑帧，不抛异常退出"""
+    import numpy as np
     frames = []
-    for fp in paths:
-        frame = cv2.imread(fp, cv2.IMREAD_COLOR)
-        if frame is None:
-            raise RuntimeError(f"Failed to read image: {fp}")
-        frames.append(frame)
+    w, h = target_size
+    for idx, fp in enumerate(paths):
+        try:
+            frame = cv2.imread(fp, cv2.IMREAD_COLOR)
+            if frame is not None:
+                frames.append(frame)
+                continue
+        except Exception as e:
+            pass
+        
+        # 读取失败 → 生成纯黑帧占位
+        print(f"⚠️  [文件读取失败] cam{idx}: {fp}，使用纯黑帧替代")
+        black_frame = np.zeros((h, w, 3), dtype=np.uint8)
+        frames.append(black_frame)
     return frames
 
 
 def get_frames_from_cams(cams: Sequence[CameraSource]) -> List:
+    """摄像头读取失败时返回纯黑帧，不抛异常退出"""
+    import numpy as np
     frames = []
     for cam in cams:
-        ok, frame = cam.cap.read()
-        if not ok or frame is None:
-            raise RuntimeError(f"Failed to read frame from {cam.name}")
-        frames.append(frame)
+        try:
+            ok, frame = cam.cap.read()
+            if ok and frame is not None:
+                frames.append(frame)
+                continue
+        except Exception as e:
+            pass
+        
+        # 读取失败 → 纯黑帧占位
+        print(f"⚠️  [摄像头读取失败] {cam.name}，使用纯黑帧替代")
+        black_frame = np.zeros((480, 640, 3), dtype=np.uint8)  # 临时尺寸，后面会统一resize
+        frames.append(black_frame)
     return frames
 
 
@@ -140,6 +168,7 @@ def fmt_ms(value: Optional[float]) -> str:
 
 
 def main() -> int:
+    import numpy as np
     args = parse_args()
     target_size = parse_resize(args.resize)
     cam_files = resolve_cam_files(args)
@@ -201,13 +230,17 @@ def main() -> int:
         while True:
             t0 = time.time()
             if cam_files is not None:
-                raw_frames = get_frames_from_files(cam_files)
+                raw_frames = get_frames_from_files(cam_files, target_size)
             else:
                 raw_frames = get_frames_from_cams(cams)
 
             jpg_list = [encode_jpeg(f, target_size, args.jpeg_quality) for f in raw_frames]
             if len(jpg_list) != 6:
-                raise RuntimeError("Internal error: expected 6 camera frames")
+                print(f"❌ 帧数量错误：{len(jpg_list)}，跳过此帧")
+                elapsed = time.time() - t0
+                if period_s > 0 and elapsed < period_s:
+                    time.sleep(period_s - elapsed)
+                continue
 
             now = time.time()
             if last_ack_recv_ts is not None and (now - last_ack_recv_ts) > args.ack_timeout_s:
@@ -260,44 +293,48 @@ def main() -> int:
                     if len(ack_parts) < 2:
                         continue
 
-                    ack_header = msgpack.unpackb(ack_parts[1], raw=False)
-                    ack_frame_id = int(ack_header.get("frame_id", -1))
-                    sender_ts = pending_ts.pop(ack_frame_id, None)
-                    if sender_ts is None:
+                    try:
+                        ack_header = msgpack.unpackb(ack_parts[1], raw=False)
+                        ack_frame_id = int(ack_header.get("frame_id", -1))
+                        sender_ts = pending_ts.pop(ack_frame_id, None)
+                        if sender_ts is None:
+                            continue
+
+                        ack_now = time.time()
+                        rtt_ms = max((ack_now - sender_ts) * 1000.0, 0.0)
+                        oneway_ms = rtt_ms / 2.0
+                        last_rtt_ms = rtt_ms
+                        last_oneway_ms = oneway_ms
+                        last_ack_recv_ts = ack_now
+                        recv_ack_count += 1
+                        rtt_window.append(rtt_ms)
+
+                        if rtt_csv_writer is not None:
+                            rtt_csv_writer.writerow(
+                                [
+                                    ack_now,
+                                    ack_frame_id,
+                                    f"{rtt_ms:.3f}",
+                                    f"{oneway_ms:.3f}",
+                                    sender_ts,
+                                    ack_header.get("receiver_recv_ts_unix", ""),
+                                    args.label,
+                                ]
+                            )
+                            rtt_csv_file.flush()
+
+                        if args.print_rtt_every > 0 and recv_ack_count % args.print_rtt_every == 0:
+                            avg_rtt = sum(rtt_window) / len(rtt_window)
+                            p95_rtt = sorted(rtt_window)[max(int(len(rtt_window) * 0.95) - 1, 0)]
+                            print(
+                                f"[sender][RTT Stats] ACKs={recv_ack_count} | "
+                                f"avg_rtt={avg_rtt:.1f}ms | p95_rtt={p95_rtt:.1f}ms | "
+                                f"last_oneway={oneway_ms:.1f}ms"
+                            )
+                            rtt_window = []
+                    except Exception as e:
+                        print(f"⚠️  ACK解析失败：{e}")
                         continue
-
-                    ack_now = time.time()
-                    rtt_ms = max((ack_now - sender_ts) * 1000.0, 0.0)
-                    oneway_ms = rtt_ms / 2.0
-                    last_rtt_ms = rtt_ms
-                    last_oneway_ms = oneway_ms
-                    last_ack_recv_ts = ack_now
-                    recv_ack_count += 1
-                    rtt_window.append(rtt_ms)
-
-                    if rtt_csv_writer is not None:
-                        rtt_csv_writer.writerow(
-                            [
-                                ack_now,
-                                ack_frame_id,
-                                f"{rtt_ms:.3f}",
-                                f"{oneway_ms:.3f}",
-                                sender_ts,
-                                ack_header.get("receiver_recv_ts_unix", ""),
-                                args.label,
-                            ]
-                        )
-                        rtt_csv_file.flush()
-
-                    if args.print_rtt_every > 0 and recv_ack_count % args.print_rtt_every == 0:
-                        avg_rtt = sum(rtt_window) / len(rtt_window)
-                        p95_rtt = sorted(rtt_window)[max(int(len(rtt_window) * 0.95) - 1, 0)]
-                        print(
-                            f"[sender][RTT Stats] ACKs={recv_ack_count} | "
-                            f"avg_rtt={avg_rtt:.1f}ms | p95_rtt={p95_rtt:.1f}ms | "
-                            f"last_oneway={oneway_ms:.1f}ms"
-                        )
-                        rtt_window = []
 
             elapsed = time.time() - t0
             if period_s > 0 and elapsed < period_s:
