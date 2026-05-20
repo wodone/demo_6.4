@@ -35,7 +35,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--topic", default="sens", help="ZMQ topic")
     p.add_argument("--fps", type=float, default=10.0, help="Target send FPS")
     p.add_argument("--jpeg-quality", type=int, default=55, help="JPEG quality [1,100]")
-    p.add_argument("--resize", default="640x384", help="Output image size WxH")
+    p.add_argument("--max-kb-per-cam", type=int, default=0,
+                   help="Max JPEG size in KB per camera (0=no limit). Adaptively lowers quality to meet target.")
+    p.add_argument("--resize", default=None,
+                   help="Max output size WxH (e.g. 640x384). Proportionally downscaled, never upscaled. "
+                        "Omit to use original frame resolution.")
     p.add_argument("--sndhwm", type=int, default=1, help="PUB send high-water mark")
 
     p.add_argument("--cam-files", nargs="*", default=None, help="Exactly 6 image files for replay mode")
@@ -57,7 +61,9 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def parse_resize(resize: str) -> Tuple[int, int]:
+def parse_resize(resize: Optional[str]) -> Optional[Tuple[int, int]]:
+    if not resize:
+        return None
     try:
         w_str, h_str = resize.lower().split("x")
         w, h = int(w_str), int(h_str)
@@ -106,40 +112,88 @@ def open_cameras(device_ids: Sequence[int]) -> List[CameraSource]:
     return cams
 
 
-def encode_jpeg(frame, wh: Tuple[int, int], quality: int) -> bytes:
-    w, h = wh
+def encode_jpeg(frame, quality: int, max_bytes: int = 0,
+                max_wh: Optional[Tuple[int, int]] = None) -> bytes:
+    """Encode frame as JPEG at original resolution.
+
+    max_wh: optional (W, H) cap — proportionally downscale to fit, never upscale.
+    max_bytes: if > 0:
+      Phase 1 — lower JPEG quality down to _MIN_QUALITY.
+      Phase 2 — if still too large, proportionally halve resolution until target is met.
+    """
+    import numpy as np
+    _MIN_QUALITY = 5
+    h_orig, w_orig = frame.shape[:2]
+
+    # Apply max_wh cap proportionally (never upscale)
+    working = frame
+    if max_wh is not None:
+        mw, mh = max_wh
+        scale = min(mw / w_orig, mh / h_orig, 1.0)
+        if scale < 1.0:
+            working = cv2.resize(frame, (int(w_orig * scale), int(h_orig * scale)),
+                                 interpolation=cv2.INTER_AREA)
+
     try:
-        resized = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-        ok, enc = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        if ok:
-            return enc.tobytes()
+        # Phase 1: quality reduction
+        q = quality
+        data = b""
+        while True:
+            ok, enc = cv2.imencode(".jpg", working, [cv2.IMWRITE_JPEG_QUALITY, q])
+            if not ok:
+                break
+            data = enc.tobytes()
+            if max_bytes <= 0 or len(data) <= max_bytes:
+                return data
+            if q <= _MIN_QUALITY:
+                break  # quality floor — enter Phase 2
+            ratio = max_bytes / len(data)
+            next_q = max(int(q * ratio) - 2, _MIN_QUALITY)
+            if next_q >= q:
+                next_q = q - 5
+            q = max(next_q, _MIN_QUALITY)
+
+        # Phase 2: proportional resolution reduction
+        if max_bytes > 0 and data:
+            h_w, w_w = working.shape[:2]
+            scale = 0.75
+            while scale >= 0.1:
+                nw = max(1, int(w_w * scale))
+                nh = max(1, int(h_w * scale))
+                small = cv2.resize(working, (nw, nh), interpolation=cv2.INTER_AREA)
+                ok, enc = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, _MIN_QUALITY])
+                if ok:
+                    data = enc.tobytes()
+                    if len(data) <= max_bytes:
+                        return data
+                scale *= 0.75
+
+        if data:
+            return data
     except Exception:
         pass
-    
+
     # 编码失败返回纯黑图
-    black = np.zeros((h, w, 3), dtype=np.uint8)
+    black = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
     ok, enc = cv2.imencode(".jpg", black, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return enc.tobytes()
 
 
-def get_frames_from_files(paths: Sequence[str], target_size: Tuple[int, int]) -> List:
+def get_frames_from_files(paths: Sequence[str]) -> List:
     """读取文件失败时返回纯黑帧，不抛异常退出"""
     import numpy as np
     frames = []
-    w, h = target_size
     for idx, fp in enumerate(paths):
         try:
             frame = cv2.imread(fp, cv2.IMREAD_COLOR)
             if frame is not None:
                 frames.append(frame)
                 continue
-        except Exception as e:
+        except Exception:
             pass
-        
-        # 读取失败 → 生成纯黑帧占位
+
         print(f"⚠️  [文件读取失败] cam{idx}: {fp}，使用纯黑帧替代")
-        black_frame = np.zeros((h, w, 3), dtype=np.uint8)
-        frames.append(black_frame)
+        frames.append(np.zeros((480, 640, 3), dtype=np.uint8))
     return frames
 
 
@@ -170,7 +224,7 @@ def fmt_ms(value: Optional[float]) -> str:
 def main() -> int:
     import numpy as np
     args = parse_args()
-    target_size = parse_resize(args.resize)
+    max_wh = parse_resize(args.resize)
     cam_files = resolve_cam_files(args)
     cam_devices = resolve_cam_devices(args)
 
@@ -214,6 +268,7 @@ def main() -> int:
     if cam_devices is not None:
         cams = open_cameras(cam_devices)
 
+    max_bytes_per_cam = args.max_kb_per_cam * 1024 if args.max_kb_per_cam > 0 else 0
     period_s = 1.0 / args.fps if args.fps > 0 else 0.0
     topic_bytes = args.topic.encode("utf-8")
     pending_ts = OrderedDict()
@@ -230,11 +285,11 @@ def main() -> int:
         while True:
             t0 = time.time()
             if cam_files is not None:
-                raw_frames = get_frames_from_files(cam_files, target_size)
+                raw_frames = get_frames_from_files(cam_files)
             else:
                 raw_frames = get_frames_from_cams(cams)
 
-            jpg_list = [encode_jpeg(f, target_size, args.jpeg_quality) for f in raw_frames]
+            jpg_list = [encode_jpeg(f, args.jpeg_quality, max_bytes_per_cam, max_wh) for f in raw_frames]
             if len(jpg_list) != 6:
                 print(f"❌ 帧数量错误：{len(jpg_list)}，跳过此帧")
                 elapsed = time.time() - t0
@@ -248,6 +303,7 @@ def main() -> int:
                 last_oneway_ms = None
                 last_ack_recv_ts = None
 
+            h0, w0 = raw_frames[0].shape[:2]
             header = {
                 "ver": 1,
                 "label": args.label,
@@ -255,7 +311,7 @@ def main() -> int:
                 "frame_id": frame_id,
                 "cam_count": 6,
                 "img_fmt": "jpg",
-                "img_size": [target_size[0], target_size[1]],
+                "img_size": [w0, h0],
                 "sender_last_rtt_ms": last_rtt_ms,
                 "sender_last_oneway_ms": last_oneway_ms,
             }
@@ -275,7 +331,7 @@ def main() -> int:
 
             if args.print_data_every > 0 and frame_id % args.print_data_every == 0:
                 print(
-                    f"[sender] payload summary | cams=6 | img_size={target_size[0]}x{target_size[1]} | "
+                    f"[sender] payload summary | cams=6 | img_size={w0}x{h0} | "
                     f"last_rtt_ms={fmt_ms(last_rtt_ms)} | last_oneway_ms={fmt_ms(last_oneway_ms)}"
                 )
 
